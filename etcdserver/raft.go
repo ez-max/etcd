@@ -58,20 +58,8 @@ var (
 )
 
 func init() {
-	lcfg := &zap.Config{
-		Level:       zap.NewAtomicLevelAt(zap.InfoLevel),
-		Development: false,
-		Sampling: &zap.SamplingConfig{
-			Initial:    100,
-			Thereafter: 100,
-		},
-		Encoding:      "json",
-		EncoderConfig: zap.NewProductionEncoderConfig(),
-
-		OutputPaths:      []string{"stderr"},
-		ErrorOutputPaths: []string{"stderr"},
-	}
-	lg, err := logutil.NewRaftLogger(lcfg)
+	lcfg := logutil.DefaultZapLoggerConfig
+	lg, err := logutil.NewRaftLogger(&lcfg)
 	if err != nil {
 		log.Fatalf("cannot create raft logger %v", err)
 	}
@@ -439,9 +427,9 @@ func startNode(cfg ServerConfig, cl *membership.RaftCluster, ids []types.ID) (id
 	)
 	if w, err = wal.Create(cfg.Logger, cfg.WALDir(), metadata); err != nil {
 		if cfg.Logger != nil {
-			cfg.Logger.Fatal("failed to create WAL", zap.Error(err))
+			cfg.Logger.Panic("failed to create WAL", zap.Error(err))
 		} else {
-			plog.Fatalf("create wal error: %v", err)
+			plog.Panicf("create wal error: %v", err)
 		}
 	}
 	peers := make([]raft.Peer, len(ids))
