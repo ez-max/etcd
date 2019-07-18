@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	pb "go.etcd.io/etcd/raft/raftpb"
+	"go.etcd.io/etcd/raft/tracker"
 )
 
 var (
@@ -40,11 +41,11 @@ func TestSendingSnapshotSetPendingSnapshot(t *testing.T) {
 
 	// force set the next of node 2, so that
 	// node 2 needs a snapshot
-	sm.prs[2].Next = sm.raftLog.firstIndex()
+	sm.prs.Progress[2].Next = sm.raftLog.firstIndex()
 
-	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: sm.prs[2].Next - 1, Reject: true})
-	if sm.prs[2].PendingSnapshot != 11 {
-		t.Fatalf("PendingSnapshot = %d, want 11", sm.prs[2].PendingSnapshot)
+	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: sm.prs.Progress[2].Next - 1, Reject: true})
+	if sm.prs.Progress[2].PendingSnapshot != 11 {
+		t.Fatalf("PendingSnapshot = %d, want 11", sm.prs.Progress[2].PendingSnapshot)
 	}
 }
 
@@ -56,7 +57,7 @@ func TestPendingSnapshotPauseReplication(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 
-	sm.prs[2].becomeSnapshot(11)
+	sm.prs.Progress[2].BecomeSnapshot(11)
 
 	sm.Step(pb.Message{From: 1, To: 1, Type: pb.MsgProp, Entries: []pb.Entry{{Data: []byte("somedata")}}})
 	msgs := sm.readMessages()
@@ -73,18 +74,18 @@ func TestSnapshotFailure(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 
-	sm.prs[2].Next = 1
-	sm.prs[2].becomeSnapshot(11)
+	sm.prs.Progress[2].Next = 1
+	sm.prs.Progress[2].BecomeSnapshot(11)
 
 	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgSnapStatus, Reject: true})
-	if sm.prs[2].PendingSnapshot != 0 {
-		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs[2].PendingSnapshot)
+	if sm.prs.Progress[2].PendingSnapshot != 0 {
+		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs.Progress[2].PendingSnapshot)
 	}
-	if sm.prs[2].Next != 1 {
-		t.Fatalf("Next = %d, want 1", sm.prs[2].Next)
+	if sm.prs.Progress[2].Next != 1 {
+		t.Fatalf("Next = %d, want 1", sm.prs.Progress[2].Next)
 	}
-	if !sm.prs[2].Paused {
-		t.Errorf("Paused = %v, want true", sm.prs[2].Paused)
+	if !sm.prs.Progress[2].ProbeSent {
+		t.Errorf("ProbeSent = %v, want true", sm.prs.Progress[2].ProbeSent)
 	}
 }
 
@@ -96,18 +97,18 @@ func TestSnapshotSucceed(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 
-	sm.prs[2].Next = 1
-	sm.prs[2].becomeSnapshot(11)
+	sm.prs.Progress[2].Next = 1
+	sm.prs.Progress[2].BecomeSnapshot(11)
 
 	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgSnapStatus, Reject: false})
-	if sm.prs[2].PendingSnapshot != 0 {
-		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs[2].PendingSnapshot)
+	if sm.prs.Progress[2].PendingSnapshot != 0 {
+		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs.Progress[2].PendingSnapshot)
 	}
-	if sm.prs[2].Next != 12 {
-		t.Fatalf("Next = %d, want 12", sm.prs[2].Next)
+	if sm.prs.Progress[2].Next != 12 {
+		t.Fatalf("Next = %d, want 12", sm.prs.Progress[2].Next)
 	}
-	if !sm.prs[2].Paused {
-		t.Errorf("Paused = %v, want true", sm.prs[2].Paused)
+	if !sm.prs.Progress[2].ProbeSent {
+		t.Errorf("ProbeSent = %v, want true", sm.prs.Progress[2].ProbeSent)
 	}
 }
 
@@ -117,30 +118,38 @@ func TestSnapshotSucceed(t *testing.T) {
 // in the past left the follower in probing status until the next log entry was
 // committed.
 func TestSnapshotSucceedViaAppResp(t *testing.T) {
-	snap := pb.Snapshot{
-		Metadata: pb.SnapshotMetadata{
-			Index:     11, // magic number
-			Term:      11, // magic number
-			ConfState: pb.ConfState{Nodes: []uint64{1, 2, 3}},
-		},
-	}
-
 	s1 := NewMemoryStorage()
-	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, s1)
-
-	// Become follower because otherwise the way this test sets things up the
-	// leadership term will be 1 (which is stale). We want it to match the snap-
-	// shot term in this test.
-	n1.becomeFollower(snap.Metadata.Term-1, 2)
+	// Create a single-node leader.
+	n1 := newTestRaft(1, []uint64{1}, 10, 1, s1)
 	n1.becomeCandidate()
 	n1.becomeLeader()
+	// We need to add a second empty entry so that we can truncate the first
+	// one away.
+	n1.Step(pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{}}})
 
-	// Apply a snapshot on the leader. This is a workaround against the fact that
-	// the leader will always append an empty entry, but that empty entry works
-	// against what we're trying to assert in this test, namely that a snapshot
-	// at the latest committed index leaves the follower in probing state.
-	// With the snapshot, the empty entry is fully committed.
-	n1.restore(snap)
+	rd := newReady(n1, &SoftState{}, pb.HardState{})
+	s1.Append(rd.Entries)
+	s1.SetHardState(rd.HardState)
+
+	if exp, ci := s1.lastIndex(), n1.raftLog.committed; ci != exp {
+		t.Fatalf("unexpected committed index %d, wanted %d: %+v", ci, exp, s1)
+	}
+
+	// Force a log truncation.
+	if err := s1.Compact(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a follower to the group. Do this in a clandestine way for simplicity.
+	// Also set up a snapshot that will be sent to the follower.
+	n1.applyConfChange(pb.ConfChange{NodeID: 2, Type: pb.ConfChangeAddNode})
+	s1.snapshot = pb.Snapshot{
+		Metadata: pb.SnapshotMetadata{
+			ConfState: pb.ConfState{Nodes: []uint64{1, 2}},
+			Index:     s1.lastIndex(),
+			Term:      s1.ents[len(s1.ents)-1].Term,
+		},
+	}
 
 	noMessage := pb.MessageType(-1)
 	mustSend := func(from, to *raft, typ pb.MessageType) pb.Message {
@@ -150,6 +159,9 @@ func TestSnapshotSucceedViaAppResp(t *testing.T) {
 				continue
 			}
 			t.Log(DescribeMessage(msg, func([]byte) string { return "" }))
+			if len(msg.Entries) > 0 {
+				t.Log(DescribeEntries(msg.Entries, func(b []byte) string { return string(b) }))
+			}
 			if err := to.Step(msg); err != nil {
 				t.Fatalf("%v: %s", msg, err)
 			}
@@ -168,7 +180,7 @@ func TestSnapshotSucceedViaAppResp(t *testing.T) {
 
 	// Create the follower that will receive the snapshot.
 	s2 := NewMemoryStorage()
-	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, s2)
+	n2 := newTestRaft(2, []uint64{1, 2}, 10, 1, s2)
 
 	// Let the leader probe the follower.
 	if !n1.maybeSendAppend(2, true /* sendIfEmpty */) {
@@ -185,9 +197,9 @@ func TestSnapshotSucceedViaAppResp(t *testing.T) {
 		t.Fatalf("expected a rejection with zero hint, got reject=%t hint=%d", msg.Reject, msg.RejectHint)
 	}
 
-	expIdx := snap.Metadata.Index
-	// Leader sends snapshot due to RejectHint of zero (the storage we use here
-	// has index zero compacted).
+	const expIdx = 2
+	// Leader sends snapshot due to RejectHint of zero (we set up the raft log
+	// to start at index 2).
 	if msg := mustSend(n1, n2, pb.MsgSnap); msg.Snapshot.Metadata.Index != expIdx {
 		t.Fatalf("expected snapshot at index %d, got %d", expIdx, msg.Snapshot.Metadata.Index)
 	}
@@ -206,8 +218,8 @@ func TestSnapshotSucceedViaAppResp(t *testing.T) {
 	mustSend(n2, n1, pb.MsgAppResp)
 
 	// Leader has correct state for follower.
-	pr := n1.prs[2]
-	if pr.State != ProgressStateReplicate {
+	pr := n1.prs.Progress[2]
+	if pr.State != tracker.StateReplicate {
 		t.Fatalf("unexpected state %v", pr)
 	}
 	if pr.Match != expIdx || pr.Next != expIdx+1 {
@@ -227,23 +239,23 @@ func TestSnapshotAbort(t *testing.T) {
 	sm.becomeCandidate()
 	sm.becomeLeader()
 
-	sm.prs[2].Next = 1
-	sm.prs[2].becomeSnapshot(11)
+	sm.prs.Progress[2].Next = 1
+	sm.prs.Progress[2].BecomeSnapshot(11)
 
 	// A successful msgAppResp that has a higher/equal index than the
 	// pending snapshot should abort the pending snapshot.
 	sm.Step(pb.Message{From: 2, To: 1, Type: pb.MsgAppResp, Index: 11})
-	if sm.prs[2].PendingSnapshot != 0 {
-		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs[2].PendingSnapshot)
+	if sm.prs.Progress[2].PendingSnapshot != 0 {
+		t.Fatalf("PendingSnapshot = %d, want 0", sm.prs.Progress[2].PendingSnapshot)
 	}
-	// The follower entered ProgressStateReplicate and the leader send an append
+	// The follower entered StateReplicate and the leader send an append
 	// and optimistically updated the progress (so we see 13 instead of 12).
 	// There is something to append because the leader appended an empty entry
 	// to the log at index 12 when it assumed leadership.
-	if sm.prs[2].Next != 13 {
-		t.Fatalf("Next = %d, want 13", sm.prs[2].Next)
+	if sm.prs.Progress[2].Next != 13 {
+		t.Fatalf("Next = %d, want 13", sm.prs.Progress[2].Next)
 	}
-	if n := sm.prs[2].ins.count; n != 1 {
+	if n := sm.prs.Progress[2].Inflights.Count(); n != 1 {
 		t.Fatalf("expected an inflight message, got %d", n)
 	}
 }
